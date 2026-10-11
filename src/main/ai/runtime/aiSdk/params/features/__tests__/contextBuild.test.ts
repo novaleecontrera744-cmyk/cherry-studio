@@ -578,6 +578,81 @@ describe('buildContextOptions — compression wiring', () => {
     })
   })
 
+  // Native tool-image routes keep each screenshot inside its tool result. The
+  // text beside it is tiny, so while the media went unpriced the budget never
+  // tripped and the whole screenshot history was sent.
+  describe('sliding-window fallback prices retained tool-result media', () => {
+    const STEPS = 8
+
+    /** system, one user request, then STEPS browser steps; a screenshot rides each tool result unless `withImages` is off. */
+    const screenshotPrompt = (withImages: boolean): LanguageModelV3Prompt => {
+      const prompt: LanguageModelV3Prompt = [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: [{ type: 'text', text: 'walk through the checkout flow' }] }
+      ]
+      for (let i = 0; i < STEPS; i++) {
+        prompt.push(
+          {
+            role: 'assistant',
+            content: [{ type: 'tool-call', toolCallId: `c${i}`, toolName: 'browser_screenshot', input: {} }]
+          },
+          {
+            role: 'tool',
+            content: [
+              {
+                type: 'tool-result',
+                toolCallId: `c${i}`,
+                toolName: 'browser_screenshot',
+                output: {
+                  type: 'content',
+                  value: [
+                    { type: 'text', text: 'ok' },
+                    ...(withImages
+                      ? [{ type: 'image-data' as const, data: 'iVBORw0KGgo=', mediaType: 'image/png' }]
+                      : [])
+                  ]
+                }
+              }
+            ]
+          }
+        )
+      }
+      return prompt
+    }
+
+    const keptStepIds = (prompt: LanguageModelV3Prompt): string[] =>
+      prompt.flatMap((m) =>
+        m.role === 'tool' ? m.content.flatMap((part) => (part.type === 'tool-result' ? [part.toolCallId] : [])) : []
+      )
+
+    // A 4k window leaves a 3.2k budget: the text alone is far under it, the screenshots far over.
+    const model = { contextWindow: 4_000 }
+    const cases: Array<[string, ScopeOverrides]> = [
+      ['a request without a resolved compressor', { model, compressionModel: null }],
+      [
+        'a temporary chat',
+        { model, compressionModel: {} as never, request: { conversation: { id: 'temp:1', topicId: 'temp:1' } } }
+      ]
+    ]
+
+    it.each(cases)('drops the oldest screenshot steps for %s', async (_name, overrides) => {
+      const out = await runTransform(screenshotPrompt(true), makeScope(overrides))
+
+      const ids = keptStepIds(out)
+      expect(ids.at(-1)).toBe(`c${STEPS - 1}`)
+      expect(ids.length).toBeLessThan(STEPS)
+      // The oldest steps went, the newest stay, and the request itself survives.
+      expect(ids).toEqual(Array.from({ length: ids.length }, (_, i) => `c${STEPS - ids.length + i}`))
+      expect(out.slice(0, 2)).toEqual(screenshotPrompt(true).slice(0, 2))
+    })
+
+    it('keeps the same history untouched once no screenshot is retained', async () => {
+      const prompt = screenshotPrompt(false)
+
+      expect(await runTransform(prompt, makeScope({ model, compressionModel: null }))).toEqual(prompt)
+    })
+  })
+
   it('attaches NO budget machinery when compression is disabled (no Janitor → no warnings)', () => {
     // Regression: setting onCompress/onBeforeCompress unconditionally made the middleware
     // build a Janitor on every request and warn when no model/tokenizer.

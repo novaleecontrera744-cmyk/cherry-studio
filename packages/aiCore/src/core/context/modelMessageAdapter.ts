@@ -7,7 +7,7 @@
 import type { LanguageModelV3ToolResultOutput } from '@ai-sdk/provider'
 import type { ModelMessage } from 'ai'
 
-import { stringifyToolOutput } from './adapter'
+import { stringifyToolOutput, toolOutputAttachments } from './adapter'
 import { ensureValidHistory } from './ensureValidHistory'
 import type { Attachment, ContextMessage, ToolCall } from './types'
 
@@ -145,6 +145,8 @@ export function fromModelMessages(messages: ModelMessage[]): ModelMessageIR[] {
               data: typeof part.data === 'string' ? part.data : '',
               ...(part.filename ? { filename: part.filename } : {})
             })
+          } else if (part.type === 'tool-result') {
+            attachments.push(...toolOutputAttachments(part.output))
           }
           // tool-approval-request parts ride through _mmAssistantContent verbatim (no IR projection).
         }
@@ -178,10 +180,12 @@ export function fromModelMessages(messages: ModelMessage[]): ModelMessageIR[] {
           // ModelMessage's ToolResultOutput is a structural superset of V3's (extra content[] members);
           // stringifyToolOutput only reads .type/.value, so the cast is safe and matches the V3 adapter's projection.
           const text = stringifyToolOutput(part.output as LanguageModelV3ToolResultOutput)
+          const attachments = toolOutputAttachments(part.output)
           anchor = {
             role: 'tool',
             content: text,
             tool_call_id: part.toolCallId,
+            ...(attachments.length ? { attachments } : {}),
             _mmToolContent: [...pending, part],
             _mmOriginalText: text,
             _mmToolName: part.toolName,

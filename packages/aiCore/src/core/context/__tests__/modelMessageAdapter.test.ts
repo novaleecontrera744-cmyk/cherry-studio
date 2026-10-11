@@ -1,7 +1,8 @@
-import type { ModelMessage } from 'ai'
+import type { ModelMessage, ToolResultPart } from 'ai'
 import { describe, expect, it } from 'vitest'
 
 import { fromModelMessages, toModelMessages } from '../modelMessageAdapter'
+import { estimateMessages } from '../tokenUtils'
 
 describe('fromModelMessages', () => {
   it('keeps string-shorthand user content as text in IR', () => {
@@ -379,6 +380,30 @@ describe('round-trip (ModelMessage → IR → ModelMessage)', () => {
         ],
         providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } }
       }
+    ],
+    'tool result with media content': [
+      { role: 'user', content: 'look' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'screenshot', input: {} }]
+      },
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'c1',
+            toolName: 'screenshot',
+            output: {
+              type: 'content',
+              value: [
+                { type: 'text', text: 'captured' },
+                { type: 'image-data', data: 'png', mediaType: 'image/png' }
+              ]
+            }
+          }
+        ]
+      }
     ]
   }
 
@@ -460,5 +485,96 @@ describe('toModelMessages', () => {
     if (toolMsg?.role !== 'tool') throw new Error('expected a tool message')
     expect(toolMsg.content).toHaveLength(1)
     expect(toolMsg.content[0].type).toBe('tool-result')
+  })
+})
+
+describe('tool-result media', () => {
+  type ToolOutputItem = Extract<ToolResultPart['output'], { type: 'content' }>['value'][number]
+
+  const text: ToolOutputItem = { type: 'text', text: 'captured' }
+  const png = (data: string): ToolOutputItem => ({ type: 'image-data', data, mediaType: 'image/png' })
+
+  const toolMessages = (output: ToolResultPart['output']): ModelMessage[] => [
+    { role: 'user', content: 'look at the page' },
+    { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'screenshot', input: {} }] },
+    { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'screenshot', output }] }
+  ]
+
+  it('projects each media item into attachments, leaving the text and the pass-through untouched', () => {
+    const messages = toolMessages({
+      type: 'content',
+      value: [
+        text,
+        png('png-bytes'),
+        // Deprecated alias the ModelMessage altitude still accepts.
+        { type: 'media', data: 'legacy-bytes', mediaType: 'image/jpeg' },
+        { type: 'image-url', url: 'https://example.com/a.png' },
+        { type: 'image-file-id', fileId: 'file_1' },
+        { type: 'file-data', data: 'pdf-bytes', mediaType: 'application/pdf', filename: 'r.pdf' },
+        { type: 'file-url', url: 'https://example.com/r.pdf', mediaType: 'application/pdf' },
+        { type: 'file-id', fileId: { openai: 'file_2' } }
+      ]
+    })
+
+    const ir = fromModelMessages(messages)
+    const tool = ir.find((m) => m.role === 'tool')
+
+    expect(tool?.content).toBe('captured')
+    expect(tool?.attachments).toEqual([
+      { mediaType: 'image/png', data: 'png-bytes' },
+      { mediaType: 'image/jpeg', data: 'legacy-bytes' },
+      { mediaType: 'image/*', data: 'https://example.com/a.png' },
+      { mediaType: 'image/*', data: '' },
+      { mediaType: 'application/pdf', data: 'pdf-bytes', filename: 'r.pdf' },
+      { mediaType: 'application/pdf', data: 'https://example.com/r.pdf' },
+      { mediaType: '', data: '' }
+    ])
+    expect(toModelMessages(ir)).toEqual(messages)
+  })
+
+  it('adds no attachments to tool results that carry no media', () => {
+    const outputs: Array<ToolResultPart['output']> = [
+      { type: 'text', value: 'plain' },
+      { type: 'content', value: [text] },
+      // JSON that merely looks like media is data, not an attachment.
+      { type: 'json', value: [{ type: 'image-data', data: 'x', mediaType: 'image/png' }] }
+    ]
+    for (const output of outputs) {
+      expect(fromModelMessages(toolMessages(output)).find((m) => m.role === 'tool')?.attachments).toBeUndefined()
+    }
+  })
+
+  it('prices every retained image once, whatever its payload size', () => {
+    const cost = (payloads: string[]) =>
+      estimateMessages(fromModelMessages(toolMessages({ type: 'content', value: [text, ...payloads.map(png)] })))
+    const none = cost([])
+    const one = cost(['A'])
+
+    expect(one).toBeGreaterThan(none)
+    expect(cost(['A', 'B', 'C'])).toBe(none + 3 * (one - none))
+    expect(cost(['A'.repeat(1_000_000)])).toBe(one)
+  })
+
+  it('counts the media of an inline provider-executed result on its assistant message', () => {
+    const original: ModelMessage[] = [
+      { role: 'user', content: 'plot it' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'c1', toolName: 'code_exec', input: {}, providerExecuted: true },
+          {
+            type: 'tool-result',
+            toolCallId: 'c1',
+            toolName: 'code_exec',
+            output: { type: 'content', value: [png('chart')] }
+          }
+        ]
+      }
+    ]
+
+    const ir = fromModelMessages(original)
+
+    expect(ir.find((m) => m.role === 'assistant')?.attachments).toEqual([{ mediaType: 'image/png', data: 'chart' }])
+    expect(toModelMessages(ir)).toEqual(original)
   })
 })

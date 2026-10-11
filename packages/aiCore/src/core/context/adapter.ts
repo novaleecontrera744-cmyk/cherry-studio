@@ -10,6 +10,7 @@ import type {
   LanguageModelV3ToolResultPart,
   SharedV3ProviderOptions
 } from '@ai-sdk/provider'
+import type { ToolResultPart } from 'ai'
 
 import { ensureValidHistory } from './ensureValidHistory'
 import type { Attachment, ContextMessage, ToolCall } from './types'
@@ -131,6 +132,8 @@ export function fromAISDK(prompt: LanguageModelV3Prompt): AISDKMessage[] {
             data: typeof part.data === 'string' ? part.data : '',
             ...(part.filename ? { filename: part.filename } : {})
           })
+        } else if (part.type === 'tool-result') {
+          attachments.push(...toolOutputAttachments(part.output))
         }
       }
 
@@ -158,10 +161,12 @@ export function fromAISDK(prompt: LanguageModelV3Prompt): AISDKMessage[] {
       for (const part of msg.content) {
         if (part.type === 'tool-result') {
           const text = stringifyToolOutput(part.output)
+          const attachments = toolOutputAttachments(part.output)
           messages.push({
             role: 'tool',
             content: text,
             tool_call_id: part.toolCallId,
+            ...(attachments.length ? { attachments } : {}),
             _toolContent: [part],
             _originalText: text,
             _toolName: part.toolName,
@@ -298,4 +303,46 @@ export function stringifyToolOutput(output: LanguageModelV3ToolResultOutput): st
     default:
       return JSON.stringify(output)
   }
+}
+
+/**
+ * Projects the media of a tool-result `content` output into IR attachments, so
+ * the flat estimate prices the screenshots and files that native tool-result
+ * routes carry. Metadata only: as with user files, the payload round-trips
+ * through the `_toolContent` pass-through and `content` stays text-only.
+ *
+ * Takes the ModelMessage output shape — a superset of V3's (it adds the
+ * deprecated `media` item) — so both adapters share it.
+ */
+export function toolOutputAttachments(output: ToolResultPart['output']): Attachment[] {
+  if (output.type !== 'content') return []
+  const attachments: Attachment[] = []
+  for (const item of output.value) {
+    switch (item.type) {
+      case 'image-data':
+      case 'media':
+        attachments.push({ mediaType: item.mediaType, data: item.data })
+        break
+      case 'file-data':
+        attachments.push({
+          mediaType: item.mediaType,
+          data: item.data,
+          ...(item.filename ? { filename: item.filename } : {})
+        })
+        break
+      case 'image-url':
+        attachments.push({ mediaType: 'image/*', data: item.url })
+        break
+      case 'file-url':
+        attachments.push({ mediaType: item.mediaType ?? '', data: item.url })
+        break
+      case 'image-file-id':
+        attachments.push({ mediaType: 'image/*', data: '' })
+        break
+      case 'file-id':
+        attachments.push({ mediaType: '', data: '' })
+        break
+    }
+  }
+  return attachments
 }
